@@ -7,18 +7,263 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-let sessionData = {};
+// ============================================================
+// QUẢN LÝ PHIÊN THÔNG MINH
+// ============================================================
 
-// Dữ liệu mẫu
-const SAMPLE_DATA = {
-    'C01': 'BPPBPPPBPPPBPBBBTPBBBBBPBPBPPPBBBBBBPBPBBPPBBPP',
-    'C02': 'BBBBBBBBPBPPTBBBPBPPPPPPBPPPBPBPPPBPPBP',
-    '1': 'BBBBBBBBPBPPTBBBPBPPPPPPBPPPBPBPPPBPPBP',
-    '2': 'BPPBPPPBPPPBPBBBTPBBBBBPBPBPPPBBBBBBPBPBBPPBBPP'
-};
+class SessionManager {
+    constructor() {
+        this.sessions = {};
+        this.CAU_THRESHOLD = 3; // Số ván tối thiểu để xác định cầu mới
+        this.MIN_STREAK_CHANGE = 2; // Thay đổi tối thiểu để xác định cầu mới
+    }
+
+    // Lấy hoặc tạo session
+    getSession(tableId, clientIp) {
+        const key = `${tableId}_${clientIp}`;
+        if (!this.sessions[key]) {
+            this.sessions[key] = {
+                phien: 0,
+                lastResult: '',
+                lastCau: '',
+                cauHistory: [],
+                streakHistory: [],
+                lastUpdate: Date.now()
+            };
+        }
+        return this.sessions[key];
+    }
+
+    // Phân tích cầu từ kết quả
+    analyzeCau(rawResult) {
+        if (!rawResult || rawResult.length < 2) return null;
+        
+        const history = rawResult.split('');
+        const cauHistory = [];
+        let currentStreak = 1;
+        let currentChar = history[0];
+        
+        for (let i = 1; i < history.length; i++) {
+            if (history[i] === currentChar) {
+                currentStreak++;
+            } else {
+                cauHistory.push({
+                    char: currentChar,
+                    length: currentStreak,
+                    start: i - currentStreak,
+                    end: i - 1
+                });
+                currentChar = history[i];
+                currentStreak = 1;
+            }
+        }
+        cauHistory.push({
+            char: currentChar,
+            length: currentStreak,
+            start: history.length - currentStreak,
+            end: history.length - 1
+        });
+
+        // Xác định loại cầu
+        if (cauHistory.length < 2) return null;
+
+        const last = cauHistory[cauHistory.length - 1];
+        const prev = cauHistory[cauHistory.length - 2];
+
+        // Cầu bệt
+        if (last.char === prev.char && cauHistory.length >= 2) {
+            return {
+                type: 'bệt',
+                char: last.char,
+                length: last.length,
+                totalLength: last.length + (prev && prev.char === last.char ? prev.length : 0),
+                confidence: Math.min(85, 50 + last.length * 5)
+            };
+        }
+
+        // Cầu đảo
+        if (last.char !== prev.char && cauHistory.length >= 2) {
+            // Kiểm tra xem có phải đảo xen kẽ không
+            let isAlternating = true;
+            for (let i = cauHistory.length - 2; i >= Math.max(0, cauHistory.length - 4); i--) {
+                if (cauHistory[i].char === cauHistory[i+1].char) {
+                    isAlternating = false;
+                    break;
+                }
+            }
+            if (isAlternating && cauHistory.length >= 3) {
+                return {
+                    type: 'đảo',
+                    char: last.char,
+                    length: last.length,
+                    confidence: Math.min(80, 55 + cauHistory.length * 3)
+                };
+            }
+        }
+
+        // Cầu nhịp
+        if (cauHistory.length >= 3) {
+            const len1 = cauHistory[cauHistory.length - 3].length;
+            const len2 = cauHistory[cauHistory.length - 2].length;
+            const len3 = cauHistory[cauHistory.length - 1].length;
+            
+            // 2-2-2
+            if (len1 === len2 && len2 === len3 && len1 >= 2) {
+                return {
+                    type: 'nhịp',
+                    pattern: `${len1}-${len2}-${len3}`,
+                    char: last.char,
+                    confidence: 82
+                };
+            }
+            // 2-3-2
+            if (len1 === 2 && len2 === 3 && len3 === 2) {
+                return {
+                    type: 'nhịp',
+                    pattern: '2-3-2',
+                    char: last.char,
+                    confidence: 85
+                };
+            }
+            // 3-2-3
+            if (len1 === 3 && len2 === 2 && len3 === 3) {
+                return {
+                    type: 'nhịp',
+                    pattern: '3-2-3',
+                    char: last.char,
+                    confidence: 85
+                };
+            }
+        }
+
+        // Cầu 1-1-2-2
+        if (cauHistory.length >= 4) {
+            const l1 = cauHistory[cauHistory.length - 4].length;
+            const l2 = cauHistory[cauHistory.length - 3].length;
+            const l3 = cauHistory[cauHistory.length - 2].length;
+            const l4 = cauHistory[cauHistory.length - 1].length;
+            
+            if (l1 === 1 && l2 === 1 && l3 === 2 && l4 === 2) {
+                return {
+                    type: '1122',
+                    char: last.char,
+                    confidence: 85
+                };
+            }
+            
+            if (l1 === 2 && l2 === 2 && l3 === 1 && l4 === 1) {
+                return {
+                    type: '2211',
+                    char: last.char,
+                    confidence: 85
+                };
+            }
+        }
+
+        // Cầu 3-3
+        if (cauHistory.length >= 2) {
+            const l1 = cauHistory[cauHistory.length - 2].length;
+            const l2 = cauHistory[cauHistory.length - 1].length;
+            if (l1 === 3 && l2 === 3 && cauHistory[cauHistory.length - 2].char !== last.char) {
+                return {
+                    type: '33',
+                    char: last.char,
+                    confidence: 88
+                };
+            }
+        }
+
+        // Cầu hỗn hợp
+        return {
+            type: 'hỗn_hợp',
+            char: last.char,
+            length: last.length,
+            confidence: 50 + Math.min(20, cauHistory.length)
+        };
+    }
+
+    // Kiểm tra xem có cầu mới không
+    isNewCau(oldCau, newCau) {
+        if (!oldCau || !newCau) return true;
+        
+        // Nếu loại cầu khác nhau
+        if (oldCau.type !== newCau.type) return true;
+        
+        // Nếu cùng loại nhưng khác ký tự
+        if (oldCau.char !== newCau.char) return true;
+        
+        // Nếu độ dài thay đổi đáng kể
+        if (Math.abs(oldCau.length - newCau.length) >= this.MIN_STREAK_CHANGE) return true;
+        
+        // Nếu cầu bệt dài > 5 và tiếp tục
+        if (newCau.type === 'bệt' && newCau.totalLength >= 6) {
+            // Kiểm tra xem có vượt ngưỡng không
+            const threshold = Math.floor(newCau.totalLength * 0.7);
+            if (oldCau.totalLength < threshold) return true;
+        }
+        
+        return false;
+    }
+
+    // Cập nhật session khi có kết quả mới
+    updateSession(tableId, clientIp, rawResult) {
+        const session = this.getSession(tableId, clientIp);
+        const newCau = this.analyzeCau(rawResult);
+        
+        // Kiểm tra nếu có dữ liệu mới
+        const hasNewData = session.lastResult !== rawResult;
+        
+        if (hasNewData) {
+            // Kiểm tra xem có cầu mới không
+            const isNewCau = this.isNewCau(session.lastCau, newCau);
+            
+            if (isNewCau && newCau && session.lastResult) {
+                // Tăng phiên khi có cầu mới
+                session.phien += 1;
+                session.cauHistory.push({
+                    phien: session.phien,
+                    cau: newCau,
+                    rawResult: rawResult,
+                    time: Date.now()
+                });
+                
+                // Giới hạn lịch sử
+                if (session.cauHistory.length > 20) {
+                    session.cauHistory = session.cauHistory.slice(-20);
+                }
+            }
+            
+            // Cập nhật dữ liệu
+            session.lastResult = rawResult;
+            session.lastCau = newCau;
+            session.lastUpdate = Date.now();
+        }
+        
+        return session;
+    }
+
+    // Reset session
+    resetSession(tableId, clientIp) {
+        const key = `${tableId}_${clientIp}`;
+        if (this.sessions[key]) {
+            this.sessions[key] = {
+                phien: 0,
+                lastResult: '',
+                lastCau: '',
+                cauHistory: [],
+                streakHistory: [],
+                lastUpdate: Date.now()
+            };
+        }
+        return this.sessions[key];
+    }
+}
+
+// Khởi tạo session manager
+const sessionManager = new SessionManager();
 
 // ============================================================
-// LỚP PHÂN TÍCH CẦU SIÊU VIP
+// LỚP PHÂN TÍCH CẦU
 // ============================================================
 
 class SieuVipAnalyzer {
@@ -38,7 +283,7 @@ class SieuVipAnalyzer {
     }
 
     // ============================================================
-    // 1. LẤY DỮ LIỆU
+    // LẤY DỮ LIỆU
     // ============================================================
     
     async fetchData() {
@@ -54,6 +299,13 @@ class SieuVipAnalyzer {
             }
             return false;
         } catch (error) {
+            // Fallback dữ liệu mẫu
+            const SAMPLE_DATA = {
+                'C01': 'BPPBPPPBPPPBPBBBTPBBBBBPBPBPPPBBBBBBPBPBBPPBBPP',
+                'C02': 'BBBBBBBBPBPPTBBBPBPPPPPPBPPPBPBPPPBPPBP',
+                '1': 'BBBBBBBBPBPPTBBBPBPPPPPPBPPPBPBPPPBPPBP',
+                '2': 'BPPBPPPBPPPBPBBBTPBBBBBPBPBPPPBBBBBBPBPBBPPBBPP'
+            };
             const sampleData = SAMPLE_DATA[this.tableId] || SAMPLE_DATA['C01'];
             if (sampleData) {
                 this.rawResult = sampleData;
@@ -66,7 +318,7 @@ class SieuVipAnalyzer {
     }
 
     // ============================================================
-    // 2. XÂY DỰNG TẤT CẢ DỮ LIỆU PHÂN TÍCH
+    // XÂY DỰNG DỮ LIỆU
     // ============================================================
     
     buildAll() {
@@ -80,7 +332,6 @@ class SieuVipAnalyzer {
         this.buildPatterns();
     }
 
-    // 2.1 Xây dựng lịch sử cầu
     buildCauHistory() {
         this.cauHistory = [];
         this.streakHistory = [];
@@ -114,7 +365,6 @@ class SieuVipAnalyzer {
         this.streakHistory.push(currentStreak);
     }
 
-    // 2.2 Xây dựng ma trận chuyển đổi
     buildMatrix() {
         this.matrix = { B: { B: 0, P: 0 }, P: { B: 0, P: 0 } };
         for (let i = 0; i < this.history.length - 1; i++) {
@@ -126,7 +376,6 @@ class SieuVipAnalyzer {
         }
     }
 
-    // 2.3 Xây dựng vị trí xuất hiện
     buildPositions() {
         this.positions = { B: [], P: [], T: [] };
         this.history.forEach((char, index) => {
@@ -136,7 +385,6 @@ class SieuVipAnalyzer {
         });
     }
 
-    // 2.4 Xây dựng khoảng cách
     buildGaps() {
         this.gaps = { B: [], P: [], T: [] };
         for (let char of ['B', 'P', 'T']) {
@@ -147,7 +395,6 @@ class SieuVipAnalyzer {
         }
     }
 
-    // 2.5 Xây dựng tần suất
     buildFrequency() {
         this.frequency = { B: 0, P: 0, T: 0 };
         this.history.forEach(char => {
@@ -157,7 +404,6 @@ class SieuVipAnalyzer {
         });
     }
 
-    // 2.6 Xây dựng Entropy
     buildEntropy() {
         const total = this.history.length;
         if (total === 0) {
@@ -176,7 +422,6 @@ class SieuVipAnalyzer {
         this.entropy = Math.min(entropy, 1);
     }
 
-    // 2.7 Xây dựng xu hướng
     buildTrends() {
         this.trends = [];
         let bCount = 0, pCount = 0;
@@ -196,7 +441,6 @@ class SieuVipAnalyzer {
         }
     }
 
-    // 2.8 Xây dựng mô hình
     buildPatterns() {
         this.patterns = {};
         for (let size = 2; size <= 7; size++) {
@@ -209,7 +453,7 @@ class SieuVipAnalyzer {
     }
 
     // ============================================================
-    // 3. NHẬN DIỆN CÁC LOẠI CẦU (10 LOẠI)
+    // NHẬN DIỆN CÁC LOẠI CẦU
     // ============================================================
 
     detectAllCau() {
@@ -226,7 +470,6 @@ class SieuVipAnalyzer {
             cauHonHop: this.detectCauHonHop()
         };
 
-        // Chọn loại cầu có độ tin cậy cao nhất
         let best = null;
         let bestScore = 0;
         
@@ -253,7 +496,6 @@ class SieuVipAnalyzer {
         const last2 = this.cauHistory[this.cauHistory.length - 2];
         const last3 = this.cauHistory[this.cauHistory.length - 3];
 
-        // Kiểm tra bệt
         if (last1.char === last2.char) {
             const totalLen = last1.length + (last2 ? last2.length : 0);
             const avgStreak = this.streakHistory.reduce((a, b) => a + b, 0) / this.streakHistory.length;
@@ -285,13 +527,11 @@ class SieuVipAnalyzer {
                 strength = 55;
             }
 
-            // Điều chỉnh nếu vượt trung bình
             if (totalLen > avgStreak * 1.5) {
                 confidence = Math.min(95, confidence + 10);
                 description += ' - Vượt trung bình, cẩn thận đảo';
             }
 
-            // Kiểm tra bệt 3-4 lần
             if (last3 && last3.char === last1.char) {
                 confidence = Math.min(95, confidence + 5);
                 description += ' - Bệt kéo dài qua 3 cầu';
@@ -321,7 +561,6 @@ class SieuVipAnalyzer {
         const last4 = this.cauHistory.slice(-4);
         const last5 = this.cauHistory.slice(-5);
 
-        // Kiểm tra xen kẽ
         let isAlternating = true;
         let pattern = [];
         
@@ -359,7 +598,6 @@ class SieuVipAnalyzer {
                 strength = 65;
             }
 
-            // Kiểm tra tỉ lệ đảo trong lịch sử
             const daoCount = this.cauHistory.filter((c, i) => 
                 i < this.cauHistory.length - 1 && c.char !== this.cauHistory[i+1].char
             ).length;
@@ -402,7 +640,6 @@ class SieuVipAnalyzer {
         let trend = '';
         let strength = 0;
 
-        // Kiểm tra 2-2-2
         if (lengths[0] === lengths[1] && lengths[1] === lengths[2] && lengths[0] >= 2) {
             if (chars[0] !== chars[1] && chars[1] !== chars[2]) {
                 isNhip = true;
@@ -414,7 +651,6 @@ class SieuVipAnalyzer {
             }
         }
 
-        // Kiểm tra 3-3-2
         if (lengths[0] === lengths[1] && lengths[1] === 3 && lengths[2] === 2) {
             isNhip = true;
             nhipType = '3-3-2';
@@ -424,7 +660,6 @@ class SieuVipAnalyzer {
             strength = 78;
         }
 
-        // Kiểm tra 2-3-2
         if (lengths[0] === 2 && lengths[1] === 3 && lengths[2] === 2) {
             isNhip = true;
             nhipType = '2-3-2';
@@ -434,7 +669,6 @@ class SieuVipAnalyzer {
             strength = 85;
         }
 
-        // Kiểm tra 3-2-3
         if (lengths[0] === 3 && lengths[1] === 2 && lengths[2] === 3) {
             isNhip = true;
             nhipType = '3-2-3';
@@ -444,7 +678,6 @@ class SieuVipAnalyzer {
             strength = 85;
         }
 
-        // Kiểm tra 2-2-3
         if (lengths[0] === 2 && lengths[1] === 2 && lengths[2] === 3) {
             isNhip = true;
             nhipType = '2-2-3';
@@ -454,7 +687,6 @@ class SieuVipAnalyzer {
             strength = 72;
         }
 
-        // Kiểm tra 3-2-2
         if (lengths[0] === 3 && lengths[1] === 2 && lengths[2] === 2) {
             isNhip = true;
             nhipType = '3-2-2';
@@ -495,7 +727,6 @@ class SieuVipAnalyzer {
             let trend = 'Tiếp tục tăng';
             let strength = 88;
 
-            // Điều chỉnh dựa trên lịch sử
             if (this.cauHistory.length > 10) {
                 const patternCount = this.patterns[4] ? (this.patterns[4]['1122'] || 0) : 0;
                 if (patternCount > 1) {
@@ -570,7 +801,6 @@ class SieuVipAnalyzer {
             let trend = 'Có thể tiếp tục 3-3';
             let strength = 92;
 
-            // Kiểm tra lịch sử
             const threeThreeCount = this.cauHistory.filter((c, i) => 
                 i < this.cauHistory.length - 1 && 
                 c.length === 3 && 
@@ -611,7 +841,6 @@ class SieuVipAnalyzer {
             let trend = 'Sắp về 2';
             let strength = 87;
 
-            // Kiểm tra lịch sử
             if (this.cauHistory.length > 10) {
                 const patternCount = this.patterns[3] ? (this.patterns[3]['232'] || 0) : 0;
                 if (patternCount > 1) {
@@ -678,7 +907,6 @@ class SieuVipAnalyzer {
 
         const last3 = this.cauHistory.slice(-3);
         
-        // B-P-B hoặc P-B-P
         if (last3[0].char !== last3[1].char && 
             last3[1].char !== last3[2].char && 
             last3[0].char === last3[2].char) {
@@ -706,7 +934,6 @@ class SieuVipAnalyzer {
                 strength = 65;
             }
 
-            // Kiểm tra lịch sử
             if (this.cauHistory.length > 10) {
                 const crossCount = this.cauHistory.filter((c, i) => 
                     i < this.cauHistory.length - 2 && 
@@ -760,7 +987,6 @@ class SieuVipAnalyzer {
         let trend = '';
         let strength = 0;
 
-        // Phân tích xu hướng tổng thể
         const diff = Math.abs(ratioB - ratioP);
         
         if (diff < 0.05) {
@@ -805,7 +1031,6 @@ class SieuVipAnalyzer {
             strength = 75;
         }
 
-        // Điều chỉnh dựa trên entropy
         if (this.entropy < 0.5) {
             confidence = Math.min(80, confidence + 10);
             description += ' - Dữ liệu ít hỗn loạn, dễ dự đoán';
@@ -814,7 +1039,6 @@ class SieuVipAnalyzer {
             description += ' - Dữ liệu hỗn loạn, khó dự đoán';
         }
 
-        // Phân tích 20 ván gần nhất
         const last20 = this.history.slice(-20);
         const bLast20 = last20.filter(c => c === 'B').length;
         const pLast20 = last20.filter(c => c === 'P').length;
@@ -829,7 +1053,6 @@ class SieuVipAnalyzer {
             trend += ' (gần đây)';
         }
 
-        // Lấy mô hình top
         const topPatterns = this.getTopPatterns();
 
         return {
@@ -850,10 +1073,6 @@ class SieuVipAnalyzer {
         };
     }
 
-    // ============================================================
-    // 4. PHÂN TÍCH MÔ HÌNH TOP
-    // ============================================================
-    
     getTopPatterns() {
         const result = [];
         for (let size of [2, 3, 4]) {
@@ -870,7 +1089,7 @@ class SieuVipAnalyzer {
     }
 
     // ============================================================
-    // 5. DỰ ĐOÁN THÔNG MINH
+    // DỰ ĐOÁN THÔNG MINH
     // ============================================================
     
     predict() {
@@ -882,12 +1101,9 @@ class SieuVipAnalyzer {
         let probB = 0.5;
         let probP = 0.5;
 
-        // ===== DỰ ĐOÁN THEO TỪNG LOẠI CẦU =====
-        
-        // Cầu bệt
+        // Dự đoán theo loại cầu
         if (cauInfo.type && cauInfo.type.includes('bệt')) {
             if (currentStreak >= 6) {
-                // Bệt siêu dài, khả năng đảo rất cao
                 if (lastChar === 'B') {
                     probP = 0.75 + Math.min(0.15, (currentStreak - 6) * 0.02);
                     probB = 1 - probP;
@@ -896,7 +1112,6 @@ class SieuVipAnalyzer {
                     probP = 1 - probB;
                 }
             } else if (currentStreak >= 4) {
-                // Bệt dài, khả năng đảo
                 if (lastChar === 'B') {
                     probP = 0.65 + (currentStreak - 4) * 0.03;
                     probB = 1 - probP;
@@ -905,7 +1120,6 @@ class SieuVipAnalyzer {
                     probP = 1 - probB;
                 }
             } else if (currentStreak >= 2) {
-                // Bệt vừa, khả năng tiếp tục
                 if (lastChar === 'B') {
                     probB = 0.62;
                     probP = 0.38;
@@ -914,7 +1128,6 @@ class SieuVipAnalyzer {
                     probB = 0.38;
                 }
             } else {
-                // Bệt mới
                 if (lastChar === 'B') {
                     probB = 0.58;
                     probP = 0.42;
@@ -924,8 +1137,6 @@ class SieuVipAnalyzer {
                 }
             }
         }
-
-        // Cầu đảo
         else if (cauInfo.type && cauInfo.type.includes('đảo')) {
             const nextChar = lastChar === 'B' ? 'P' : 'B';
             if (nextChar === 'B') {
@@ -936,15 +1147,12 @@ class SieuVipAnalyzer {
                 probB = 1 - probP;
             }
         }
-
-        // Cầu nhịp
         else if (cauInfo.type && cauInfo.type.includes('nhịp')) {
             const lengths = cauInfo.lengths || [];
             if (lengths.length >= 2) {
                 const lastLen = lengths[lengths.length - 1];
                 const prevLen = lengths[lengths.length - 2];
                 
-                // Dự đoán độ dài tiếp theo
                 let nextLen = 0;
                 if (lastLen === prevLen) {
                     nextLen = lastLen;
@@ -967,9 +1175,7 @@ class SieuVipAnalyzer {
                 }
             }
         }
-
-        // Cầu 1-1-2-2
-        else if (cauInfo.type && cauInfo.type.includes('1-1-2-2')) {
+        else if (cauInfo.type && cauInfo.type.includes('1122')) {
             const currentLen = this.cauHistory[this.cauHistory.length - 1].length;
             if (currentLen === 2) {
                 const nextChar = lastChar === 'B' ? 'P' : 'B';
@@ -980,9 +1186,7 @@ class SieuVipAnalyzer {
                 else probP = 0.60;
             }
         }
-
-        // Cầu 2-2-1-1
-        else if (cauInfo.type && cauInfo.type.includes('2-2-1-1')) {
+        else if (cauInfo.type && cauInfo.type.includes('2211')) {
             const currentLen = this.cauHistory[this.cauHistory.length - 1].length;
             if (currentLen === 1) {
                 const nextChar = lastChar === 'B' ? 'P' : 'B';
@@ -993,8 +1197,6 @@ class SieuVipAnalyzer {
                 else probP = 0.60;
             }
         }
-
-        // Cầu 3-3
         else if (cauInfo.type && cauInfo.type.includes('3-3')) {
             if (currentStreak === 3) {
                 const nextChar = lastChar === 'B' ? 'P' : 'B';
@@ -1008,8 +1210,6 @@ class SieuVipAnalyzer {
                 else probP = 0.58;
             }
         }
-
-        // Cầu 2-3-2
         else if (cauInfo.type && cauInfo.type.includes('2-3-2')) {
             const currentLen = this.cauHistory[this.cauHistory.length - 1].length;
             if (currentLen === 3) {
@@ -1024,8 +1224,6 @@ class SieuVipAnalyzer {
                 else probP = 0.55;
             }
         }
-
-        // Cầu 3-2-3
         else if (cauInfo.type && cauInfo.type.includes('3-2-3')) {
             const currentLen = this.cauHistory[this.cauHistory.length - 1].length;
             if (currentLen === 2) {
@@ -1040,8 +1238,6 @@ class SieuVipAnalyzer {
                 else probP = 0.55;
             }
         }
-
-        // Cầu xen kẽ chéo
         else if (cauInfo.type && cauInfo.type.includes('xen kẽ')) {
             const nextChar = lastChar === 'B' ? 'P' : 'B';
             if (nextChar === 'B') {
@@ -1052,10 +1248,7 @@ class SieuVipAnalyzer {
                 probB = 1 - probP;
             }
         }
-
-        // Cầu hỗn hợp
         else {
-            // Dùng thống kê tổng thể
             const ratio = this.frequency.B / this.history.length;
             if (ratio > 0.55) {
                 probB = 0.55 + (ratio - 0.55) * 0.6;
@@ -1068,7 +1261,6 @@ class SieuVipAnalyzer {
                 probP = 0.48;
             }
 
-            // Điều chỉnh theo xu hướng gần đây
             const last20 = this.history.slice(-20);
             const bLast20 = last20.filter(c => c === 'B').length;
             if (bLast20 > 12) {
@@ -1080,7 +1272,7 @@ class SieuVipAnalyzer {
             }
         }
 
-        // ===== ĐIỀU CHỈNH THEO ĐỘ TIN CẬY =====
+        // Điều chỉnh theo độ tin cậy
         const confidenceFactor = (cauInfo.confidence || 50) / 100;
         if (probB > 0.5) {
             probB = 0.5 + (probB - 0.5) * (0.7 + confidenceFactor * 0.3);
@@ -1090,7 +1282,7 @@ class SieuVipAnalyzer {
             probB = 1 - probP;
         }
 
-        // ===== ĐẢM BẢO 50-80% =====
+        // Giới hạn 50-80%
         const maxProb = 0.80;
         const minProb = 0.50;
 
@@ -1112,12 +1304,10 @@ class SieuVipAnalyzer {
             probB = 1 - minProb;
         }
 
-        // Normalize
         const total = probB + probP;
         probB = Math.round((probB / total) * 1000) / 10;
         probP = Math.round((probP / total) * 1000) / 10;
 
-        // Chọn dự đoán
         const prediction = probB > probP ? 'B' : 'P';
 
         return {
@@ -1149,18 +1339,13 @@ class SieuVipAnalyzer {
 }
 
 // ============================================================
-// 6. API
+// API ENDPOINTS
 // ============================================================
 
 app.get('/api/predict/:tableId', async (req, res) => {
     try {
         const { tableId } = req.params;
         const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-        const sessionKey = `${tableId}_${clientIp}`;
-        
-        if (!sessionData[sessionKey]) {
-            sessionData[sessionKey] = { phien: 0, lastResult: '' };
-        }
         
         const analyzer = new SieuVipAnalyzer(tableId);
         const success = await analyzer.fetchData();
@@ -1173,17 +1358,12 @@ app.get('/api/predict/:tableId', async (req, res) => {
         }
         
         const result = analyzer.predict();
-        
-        // Tăng phiên khi có kết quả mới
-        if (sessionData[sessionKey].lastResult !== result.rawResult) {
-            sessionData[sessionKey].phien += 1;
-            sessionData[sessionKey].lastResult = result.rawResult;
-        }
+        const session = sessionManager.updateSession(tableId, clientIp, result.rawResult);
         
         res.json({
             success: true,
             data: {
-                phien: sessionData[sessionKey].phien,
+                phien: session.phien,
                 duDoan: result.prediction,
                 tiLe: `${result.probB}% - ${result.probP}%`,
                 cau: {
@@ -1202,7 +1382,13 @@ app.get('/api/predict/:tableId', async (req, res) => {
                     T: result.tCount,
                     entropy: result.entropy
                 },
-                topPatterns: result.cauInfo.topPatterns || []
+                topPatterns: result.cauInfo.topPatterns || [],
+                lichSuCau: session.cauHistory.slice(-5).map(item => ({
+                    phien: item.phien,
+                    loaiCau: item.cau.type,
+                    char: item.cau.char,
+                    doTinCay: item.cau.confidence
+                }))
             }
         });
         
@@ -1214,10 +1400,6 @@ app.get('/api/predict/:tableId', async (req, res) => {
     }
 });
 
-// ============================================================
-// 7. BATCH API
-// ============================================================
-
 app.post('/api/predict/batch', async (req, res) => {
     try {
         const { tables = ['C01', 'C02', 'C03', '1', '2'] } = req.body;
@@ -1225,26 +1407,16 @@ app.post('/api/predict/batch', async (req, res) => {
         const results = [];
         
         for (const tableId of tables) {
-            const sessionKey = `${tableId}_${clientIp}`;
-            
-            if (!sessionData[sessionKey]) {
-                sessionData[sessionKey] = { phien: 0, lastResult: '' };
-            }
-            
             const analyzer = new SieuVipAnalyzer(String(tableId));
             const success = await analyzer.fetchData();
             
             if (success) {
                 const result = analyzer.predict();
-                
-                if (sessionData[sessionKey].lastResult !== result.rawResult) {
-                    sessionData[sessionKey].phien += 1;
-                    sessionData[sessionKey].lastResult = result.rawResult;
-                }
+                const session = sessionManager.updateSession(String(tableId), clientIp, result.rawResult);
                 
                 results.push({
                     table: tableId,
-                    phien: sessionData[sessionKey].phien,
+                    phien: session.phien,
                     duDoan: result.prediction,
                     tiLe: `${result.probB}% - ${result.probP}%`,
                     cau: result.cauInfo.type || 'Chưa xác định',
@@ -1266,22 +1438,15 @@ app.post('/api/predict/batch', async (req, res) => {
     }
 });
 
-// ============================================================
-// 8. CÁC API KHÁC
-// ============================================================
-
 app.post('/api/reset/:tableId', (req, res) => {
     const { tableId } = req.params;
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-    const sessionKey = `${tableId}_${clientIp}`;
     
-    if (sessionData[sessionKey]) {
-        sessionData[sessionKey].phien = 0;
-        sessionData[sessionKey].lastResult = '';
-    }
+    const session = sessionManager.resetSession(tableId, clientIp);
     res.json({
         success: true,
-        message: `Đã reset phiên cho bàn ${tableId}`
+        message: `Đã reset phiên cho bàn ${tableId}`,
+        phien: session.phien
     });
 });
 
@@ -1290,12 +1455,15 @@ app.get('/api/health', (req, res) => {
         status: 'OK',
         timestamp: new Date().toISOString(),
         version: 'VIP 3.0',
-        sessions: Object.keys(sessionData).length
+        sessions: Object.keys(sessionManager.sessions).length,
+        activeSessions: Object.keys(sessionManager.sessions).filter(key => 
+            sessionManager.sessions[key].lastResult
+        ).length
     });
 });
 
 // ============================================================
-// 9. START SERVER
+// START SERVER
 // ============================================================
 
 app.listen(PORT, () => {
@@ -1316,8 +1484,10 @@ app.listen(PORT, () => {
     console.log('  10. Cầu hỗn hợp');
     console.log('========================================');
     console.log('📊 Tỉ lệ dự đoán: 50-80%');
-    console.log('🔄 F5 không tăng phiên');
+    console.log('🔄 F5 KHÔNG tăng phiên');
+    console.log('📈 Phiên chỉ tăng khi CÓ CẦU MỚI');
     console.log('📦 Hiển thị cầu gốc từ API');
     console.log('🎯 Không random, không cứng nhắc');
+    console.log('📋 Lưu lịch sử 20 phiên gần nhất');
     console.log('========================================');
 });
