@@ -29,7 +29,7 @@ class SessionManager {
         return this.sessions[key];
     }
 
-    updateSession(tableId, clientIp, ketQuaMoi, cauInfo) {
+    updateSession(tableId, clientIp, ketQuaMoi, cauInfo, cauGoc) {
         const session = this.getSession(tableId, clientIp);
         
         if (session.lastResult !== ketQuaMoi && ketQuaMoi) {
@@ -39,6 +39,7 @@ class SessionManager {
             session.history.push({
                 phien: session.phien,
                 ketQua: ketQuaMoi,
+                cauGoc: cauGoc,
                 time: new Date().toISOString()
             });
             
@@ -483,7 +484,6 @@ class SieuCauAnalyzer {
         const chars = last4.map(c => c.char);
         const lens = last4.map(c => c.length);
         
-        // Kiểm tra các pattern nhịp
         const patterns = [
             { lens: [2, 2, 2], confidence: 80, description: 'NHỊP 2-2-2 ĐỀU' },
             { lens: [3, 3, 2], confidence: 78, description: 'NHỊP 3-3-2 - ĐANG GIẢM' },
@@ -1034,6 +1034,7 @@ class SieuCauAnalyzer {
             allCau: this.allCau.slice(0, 10),
             currentStreak: currentStreak,
             ketQuaMoiNhat: this.ketQuaMoiNhat,
+            cauGoc: this.rawResult,
             total: total,
             bCount: bCount,
             pCount: pCount,
@@ -1070,7 +1071,7 @@ app.get('/api/predict/:tableId', async (req, res) => {
         }
         
         const result = analyzer.predict();
-        const session = sessionManager.updateSession(tableId, clientIp, result.ketQuaMoiNhat, result.bestCau);
+        const session = sessionManager.updateSession(tableId, clientIp, result.ketQuaMoiNhat, result.bestCau, result.cauGoc);
         
         res.json({
             success: true,
@@ -1080,6 +1081,7 @@ app.get('/api/predict/:tableId', async (req, res) => {
                 phienDuDoan: session.phien + 1,
                 duDoan: result.prediction,
                 tiLe: `${result.probB}% - ${result.probP}%`,
+                cauGoc: result.cauGoc,
                 cauTotNhat: result.bestCau,
                 tatCaCau: result.allCau,
                 thongKe: result.statistics,
@@ -1107,7 +1109,7 @@ app.post('/api/predict/batch', async (req, res) => {
             
             if (success) {
                 const result = analyzer.predict();
-                const session = sessionManager.updateSession(String(tableId), clientIp, result.ketQuaMoiNhat, result.bestCau);
+                const session = sessionManager.updateSession(String(tableId), clientIp, result.ketQuaMoiNhat, result.bestCau, result.cauGoc);
                 
                 results.push({
                     table: tableId,
@@ -1116,6 +1118,7 @@ app.post('/api/predict/batch', async (req, res) => {
                     phienDuDoan: session.phien + 1,
                     duDoan: result.prediction,
                     tiLe: `${result.probB}% - ${result.probP}%`,
+                    cauGoc: result.cauGoc,
                     cauTotNhat: result.bestCau,
                     thongKe: result.statistics,
                     aiInfo: result.aiInfo
@@ -1201,5 +1204,6 @@ app.listen(PORT, () => {
     console.log('🧠 PHÂN TÍCH THÔNG MINH');
     console.log('🔄 F5 KHÔNG TĂNG PHIÊN');
     console.log('📊 KẾT QUẢ: B, P, HOẶC T');
+    console.log('📜 CẦU GỐC TỪ API');
     console.log('========================================');
 });
