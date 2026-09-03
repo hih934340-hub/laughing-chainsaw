@@ -8,7 +8,7 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================
-// QUẢN LÝ PHIÊN THÔNG MINH
+// QUẢN LÝ PHIÊN - TĂNG PHIÊN KHI CÓ KẾT QUẢ MỚI TỪ API
 // ============================================================
 
 class SessionManager {
@@ -21,70 +21,67 @@ class SessionManager {
         if (!this.sessions[key]) {
             this.sessions[key] = {
                 phien: 0,
-                lastCauKey: '',
                 lastRawResult: '',
-                cauHistory: [],
+                history: [],
                 allCauDetected: []
             };
         }
         return this.sessions[key];
     }
 
-    getCauKey(rawResult) {
-        if (!rawResult || rawResult.length < 2) return '';
-        const chars = rawResult.split('');
-        let key = '';
-        let current = chars[0];
-        let count = 0;
-        for (let i = 0; i < chars.length; i++) {
-            if (chars[i] === current) count++;
-            else {
-                key += current + count;
-                current = chars[i];
-                count = 1;
-            }
-        }
-        key += current + count;
-        return key;
-    }
-
-    isNewCau(oldKey, newKey) {
-        if (!oldKey || !newKey) return true;
-        return oldKey !== newKey;
-    }
-
     updateSession(tableId, clientIp, rawResult, cauInfo) {
         const session = this.getSession(tableId, clientIp);
-        const newCauKey = this.getCauKey(rawResult);
         
-        if (this.isNewCau(session.lastCauKey, newCauKey) && rawResult) {
+        // Nếu cầu mới khác cầu cũ -> tăng phiên
+        if (session.lastRawResult !== rawResult && rawResult) {
             session.phien += 1;
-            session.allCauDetected.push({
+            session.lastRawResult = rawResult;
+            
+            session.history.push({
                 phien: session.phien,
-                cauKey: newCauKey,
-                cauInfo: cauInfo,
-                rawResult: rawResult,
+                ketQua: rawResult,
                 time: new Date().toISOString()
             });
             
+            if (cauInfo) {
+                session.allCauDetected.push({
+                    phien: session.phien,
+                    cauInfo: cauInfo,
+                    time: new Date().toISOString()
+                });
+            }
+            
+            // Giữ 50 phiên gần nhất
+            if (session.history.length > 50) {
+                session.history = session.history.slice(-50);
+            }
             if (session.allCauDetected.length > 50) {
                 session.allCauDetected = session.allCauDetected.slice(-50);
             }
         }
         
-        session.lastCauKey = newCauKey;
-        session.lastRawResult = rawResult;
         return session;
+    }
+
+    resetSession(tableId, clientIp) {
+        const key = `${tableId}_${clientIp}`;
+        this.sessions[key] = {
+            phien: 0,
+            lastRawResult: '',
+            history: [],
+            allCauDetected: []
+        };
+        return this.sessions[key];
     }
 }
 
 const sessionManager = new SessionManager();
 
 // ============================================================
-// SIÊU PHÂN TÍCH CẦU - NHẬN DIỆN ALL CẦU
+// PHÂN TÍCH CẦU CỰC KỲ CHI TIẾT - LẤY TỪ API
 // ============================================================
 
-class SieuCauAnalyzer {
+class CauAnalyzer {
     constructor(tableId) {
         this.tableId = tableId;
         this.rawResult = '';
@@ -97,44 +94,37 @@ class SieuCauAnalyzer {
         this.positions = { B: [], P: [], T: [] };
         this.patterns = {};
         this.allCau = [];
+        this.apiData = null;
     }
 
     async fetchData() {
         try {
             const url = `https://symmetrical-carnival-d111.onrender.com/api/baccarat/${this.tableId}`;
-            const response = await axios.get(url, { timeout: 5000 });
+            const response = await axios.get(url, { timeout: 10000 });
             
             if (response.data && response.data.success) {
-                this.rawResult = response.data.data.result;
+                this.apiData = response.data.data;
+                this.rawResult = response.data.data.result || response.data.data.rawResult || '';
+                
+                if (!this.rawResult) {
+                    console.error('API không trả về result');
+                    return false;
+                }
+                
                 this.history = this.rawResult.split('');
                 this.length = this.history.length;
                 this.buildAll();
                 return true;
+            } else {
+                console.error('API trả về success = false');
+                return false;
             }
-            return false;
         } catch (error) {
-            const SAMPLE_DATA = {
-                'C01': 'BPPBPPPBPPPBPBBBTPBBBBBPBPBPPPBBBBBBPBPBBPPBBPP',
-                'C02': 'BBBBBBBBPBPPTBBBPBPPPPPPBPPPBPBPPPBPPBP',
-                '1': 'BBBBBBBBPBPPTBBBPBPPPPPPBPPPBPBPPPBPPBP',
-                '2': 'BPPBPPPBPPPBPBBBTPBBBBBPBPBPPPBBBBBBPBPBBPPBBPP'
-            };
-            const sampleData = SAMPLE_DATA[this.tableId] || SAMPLE_DATA['C01'];
-            if (sampleData) {
-                this.rawResult = sampleData;
-                this.history = sampleData.split('');
-                this.length = this.history.length;
-                this.buildAll();
-                return true;
-            }
+            console.error('Lỗi fetch data:', error.message);
             return false;
         }
     }
 
-    // ============================================================
-    // XÂY DỰNG TẤT CẢ DỮ LIỆU
-    // ============================================================
-    
     buildAll() {
         this.buildCauHistory();
         this.buildFrequency();
@@ -209,56 +199,25 @@ class SieuCauAnalyzer {
     detectAllCau() {
         this.allCau = [];
         
-        // 1. Cầu bệt
         this.detectCauBet();
-        
-        // 2. Cầu đảo
         this.detectCauDao();
-        
-        // 3. Cầu nhịp
         this.detectCauNhip();
-        
-        // 4. Cầu 1-1-2-2
         this.detectCau1122();
-        
-        // 5. Cầu 2-2-1-1
         this.detectCau2211();
-        
-        // 6. Cầu 3-3
         this.detectCau33();
-        
-        // 7. Cầu 2-3-2
         this.detectCau232();
-        
-        // 8. Cầu 3-2-3
         this.detectCau323();
-        
-        // 9. Cầu xen kẽ chéo
         this.detectCauXenKe();
-        
-        // 10. Cầu 1-2-1-2
         this.detectCau1212();
-        
-        // 11. Cầu 2-1-2-1
         this.detectCau2121();
-        
-        // 12. Cầu 1-1-1-2
         this.detectCau1112();
-        
-        // 13. Cầu 2-1-1-1
         this.detectCau2111();
-        
-        // 14. Cầu dài (cực dài)
         this.detectCauDai();
-        
-        // 15. Cầu hỗn hợp
         this.detectCauHonHop();
         
-        // Sắp xếp theo độ tin cậy
         this.allCau.sort((a, b) => b.confidence - a.confidence);
     }
 
-    // 1. CẦU BỆT
     detectCauBet() {
         if (this.cauHistory.length < 2) return;
         
@@ -304,7 +263,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 2. CẦU ĐẢO
     detectCauDao() {
         if (this.cauHistory.length < 4) return;
         
@@ -342,7 +300,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 3. CẦU NHỊP
     detectCauNhip() {
         if (this.cauHistory.length < 4) return;
         
@@ -397,7 +354,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 4. CẦU 1-1-2-2
     detectCau1122() {
         if (this.cauHistory.length < 4) return;
         
@@ -414,7 +370,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 5. CẦU 2-2-1-1
     detectCau2211() {
         if (this.cauHistory.length < 4) return;
         
@@ -431,7 +386,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 6. CẦU 3-3
     detectCau33() {
         if (this.cauHistory.length < 2) return;
         
@@ -447,7 +401,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 7. CẦU 2-3-2
     detectCau232() {
         if (this.cauHistory.length < 3) return;
         
@@ -464,7 +417,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 8. CẦU 3-2-3
     detectCau323() {
         if (this.cauHistory.length < 3) return;
         
@@ -481,7 +433,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 9. CẦU XEN KẼ CHÉO
     detectCauXenKe() {
         if (this.cauHistory.length < 3) return;
         
@@ -509,7 +460,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 10. CẦU 1-2-1-2
     detectCau1212() {
         if (this.cauHistory.length < 4) return;
         
@@ -526,7 +476,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 11. CẦU 2-1-2-1
     detectCau2121() {
         if (this.cauHistory.length < 4) return;
         
@@ -543,7 +492,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 12. CẦU 1-1-1-2
     detectCau1112() {
         if (this.cauHistory.length < 4) return;
         
@@ -560,7 +508,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 13. CẦU 2-1-1-1
     detectCau2111() {
         if (this.cauHistory.length < 4) return;
         
@@ -577,7 +524,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 14. CẦU DÀI (CỰC DÀI)
     detectCauDai() {
         if (this.history.length < 20) return;
         
@@ -608,7 +554,6 @@ class SieuCauAnalyzer {
         }
     }
 
-    // 15. CẦU HỖN HỢP
     detectCauHonHop() {
         const bCount = this.frequency.B || 0;
         const pCount = this.frequency.P || 0;
@@ -682,13 +627,9 @@ class SieuCauAnalyzer {
         return streak;
     }
 
-    // ============================================================
-    // DỰ ĐOÁN THÔNG MINH - KHÔNG RANDOM, KHÔNG CỨNG
-    // ============================================================
-    
     predict() {
         if (this.history.length === 0) {
-            return { prediction: 'B', probB: 50, probP: 50, cau: null };
+            return { prediction: 'B', probB: 50, probP: 50 };
         }
 
         const lastChar = this.history[this.history.length - 1];
@@ -697,19 +638,16 @@ class SieuCauAnalyzer {
         const pCount = this.frequency.P || 0;
         const total = this.length;
         
-        // Phân tích ALL CẦU
         this.detectAllCau();
         
-        // Lấy cầu có độ tin cậy cao nhất
         const bestCau = this.allCau.length > 0 ? this.allCau[0] : null;
         
         let probB = 0.5;
         let probP = 0.5;
         
-        // ===== DỰ ĐOÁN DỰA TRÊN CẦU TỐT NHẤT =====
+        // Dự đoán dựa trên cầu tốt nhất
         if (bestCau) {
             if (bestCau.type === 'Cầu bệt' || bestCau.type === 'Cầu cực dài' || bestCau.type === 'Cầu siêu dài') {
-                // Bệt dài → khả năng đảo cao
                 if (bestCau.length >= 8) {
                     if (bestCau.char === 'B') {
                         probP = 0.70 + Math.min(0.10, (bestCau.length - 8) * 0.02);
@@ -737,7 +675,6 @@ class SieuCauAnalyzer {
                 }
             }
             else if (bestCau.type === 'Cầu đảo') {
-                // Đảo → đánh ngược
                 const nextChar = lastChar === 'B' ? 'P' : 'B';
                 if (nextChar === 'B') {
                     probB = 0.60 + bestCau.confidence / 100 * 0.15;
@@ -748,29 +685,17 @@ class SieuCauAnalyzer {
                 }
             }
             else if (bestCau.type.includes('nhịp')) {
-                // Nhịp → dựa vào pattern
                 const pattern = bestCau.pattern || '';
-                const lastLen = this.cauHistory[this.cauHistory.length - 1].length;
-                
-                let nextLen = 0;
-                if (pattern === '2-2-2') nextLen = 2;
-                else if (pattern === '3-3-2') nextLen = 2;
-                else if (pattern === '2-3-2') nextLen = 2;
-                else if (pattern === '3-2-3') nextLen = 3;
-                
-                if (nextLen >= 2) {
-                    const nextChar = lastChar === 'B' ? 'P' : 'B';
-                    if (nextChar === 'B') probB = 0.60;
-                    else probP = 0.60;
-                }
+                const nextChar = lastChar === 'B' ? 'P' : 'B';
+                if (nextChar === 'B') probB = 0.60;
+                else probP = 0.60;
             }
-            else if (bestCau.type.includes('1-1-2-2') || bestCau.type.includes('2-2-1-1')) {
-                const currentLen = this.cauHistory[this.cauHistory.length - 1].length;
-                if (currentLen === 2 || currentLen === 1) {
-                    const nextChar = lastChar === 'B' ? 'P' : 'B';
-                    if (nextChar === 'B') probB = 0.65;
-                    else probP = 0.65;
-                }
+            else if (bestCau.type.includes('1-1-2-2') || bestCau.type.includes('2-2-1-1') || 
+                     bestCau.type.includes('1-2-1-2') || bestCau.type.includes('2-1-2-1') ||
+                     bestCau.type.includes('1-1-1-2') || bestCau.type.includes('2-1-1-1')) {
+                const nextChar = lastChar === 'B' ? 'P' : 'B';
+                if (nextChar === 'B') probB = 0.65;
+                else probP = 0.65;
             }
             else if (bestCau.type.includes('xen kẽ')) {
                 const nextChar = lastChar === 'B' ? 'P' : 'B';
@@ -783,7 +708,6 @@ class SieuCauAnalyzer {
                 }
             }
             else if (bestCau.type === 'Cầu hỗn hợp') {
-                // Dùng tỉ lệ tổng thể
                 const ratioB = bCount / total;
                 if (ratioB > 0.55) {
                     probB = 0.55 + (ratioB - 0.55) * 0.6;
@@ -793,9 +717,14 @@ class SieuCauAnalyzer {
                     probB = 1 - probP;
                 }
             }
+            else if (bestCau.type === 'Cầu 3-3' || bestCau.type === 'Cầu 2-3-2' || bestCau.type === 'Cầu 3-2-3') {
+                const nextChar = lastChar === 'B' ? 'P' : 'B';
+                if (nextChar === 'B') probB = 0.62;
+                else probP = 0.62;
+            }
         }
         
-        // ===== ĐIỀU CHỈNH THEO ĐỘ TIN CẬY =====
+        // Điều chỉnh theo độ tin cậy
         const confidence = bestCau ? bestCau.confidence : 50;
         const factor = confidence / 100;
         
@@ -807,7 +736,7 @@ class SieuCauAnalyzer {
             probB = 1 - probP;
         }
         
-        // ===== GIỚI HẠN 55-80% =====
+        // Giới hạn 55-80%
         const maxProb = 0.80;
         const minProb = 0.55;
         
@@ -835,21 +764,21 @@ class SieuCauAnalyzer {
         
         const prediction = probB >= probP ? 'B' : 'P';
         
-        // ===== TRẢ VỀ TẤT CẢ THÔNG TIN =====
         return {
             prediction: prediction,
             probB: probB,
             probP: probP,
             bestCau: bestCau,
-            allCau: this.allCau.slice(0, 5), // Top 5 cầu
+            allCau: this.allCau.slice(0, 5),
             currentStreak: currentStreak,
             lastChar: lastChar,
-            total: this.length,
+            total: total,
             bCount: bCount,
             pCount: pCount,
             tCount: this.frequency.T || 0,
             rawResult: this.rawResult,
-            cauHistory: this.cauHistory
+            cauHistory: this.cauHistory,
+            apiData: this.apiData
         };
     }
 }
@@ -863,41 +792,31 @@ app.get('/api/predict/:tableId', async (req, res) => {
         const { tableId } = req.params;
         const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
         
-        const analyzer = new SieuCauAnalyzer(tableId);
+        const analyzer = new CauAnalyzer(tableId);
         const success = await analyzer.fetchData();
         
         if (!success) {
             return res.json({
                 success: false,
-                error: 'Không có dữ liệu cho bàn này'
+                error: 'Không lấy được dữ liệu từ API'
             });
         }
         
         const result = analyzer.predict();
         const session = sessionManager.updateSession(tableId, clientIp, result.rawResult, result.bestCau);
         
+        // Trả về gọn gàng
         res.json({
             success: true,
             data: {
                 phien: session.phien,
+                ketQua: result.rawResult,
+                phienDuDoan: session.phien + 1,
                 duDoan: result.prediction,
                 tiLe: `${result.probB}% - ${result.probP}%`,
-                cauTotNhat: result.bestCau,
-                tatCaCau: result.allCau,
-                chuoiHienTai: result.lastChar.repeat(result.currentStreak) || 'Chưa có',
                 cauGoc: result.rawResult,
-                thongKe: {
-                    tongVan: result.total,
-                    B: result.bCount,
-                    P: result.pCount,
-                    T: result.tCount
-                },
-                lichSuCau: session.allCauDetected.slice(-5).map(item => ({
-                    phien: item.phien,
-                    loaiCau: item.cauInfo ? item.cauInfo.type : 'Không xác định',
-                    doTinCay: item.cauInfo ? item.cauInfo.confidence : 0,
-                    thoiGian: item.time
-                }))
+                cauTotNhat: result.bestCau,
+                tatCaCau: result.allCau
             }
         });
         
@@ -916,7 +835,7 @@ app.post('/api/predict/batch', async (req, res) => {
         const results = [];
         
         for (const tableId of tables) {
-            const analyzer = new SieuCauAnalyzer(String(tableId));
+            const analyzer = new CauAnalyzer(String(tableId));
             const success = await analyzer.fetchData();
             
             if (success) {
@@ -926,10 +845,12 @@ app.post('/api/predict/batch', async (req, res) => {
                 results.push({
                     table: tableId,
                     phien: session.phien,
+                    ketQua: result.rawResult,
+                    phienDuDoan: session.phien + 1,
                     duDoan: result.prediction,
                     tiLe: `${result.probB}% - ${result.probP}%`,
-                    cau: result.bestCau ? result.bestCau.type : 'Chưa xác định',
-                    doTinCay: result.bestCau ? result.bestCau.confidence : 0
+                    cauGoc: result.rawResult,
+                    cauTotNhat: result.bestCau
                 });
             }
         }
@@ -952,6 +873,7 @@ app.post('/api/reset/:tableId', (req, res) => {
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
     
     const session = sessionManager.resetSession(tableId, clientIp);
+    
     res.json({
         success: true,
         message: `Đã reset phiên cho bàn ${tableId}`,
@@ -959,11 +881,18 @@ app.post('/api/reset/:tableId', (req, res) => {
     });
 });
 
+app.get('/api/sessions', (req, res) => {
+    res.json({
+        success: true,
+        data: sessionManager.sessions
+    });
+});
+
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'OK',
         timestamp: new Date().toISOString(),
-        version: 'SIÊU VIP 4.0',
+        version: 'FULL API',
         sessions: Object.keys(sessionManager.sessions).length
     });
 });
@@ -974,29 +903,12 @@ app.get('/api/health', (req, res) => {
 
 app.listen(PORT, () => {
     console.log('========================================');
-    console.log('🚀 SIÊU VIP ANALYZER v4.0');
+    console.log('🚀 ANALYZER FULL API');
     console.log('========================================');
     console.log(`📡 Server: http://localhost:${PORT}`);
-    console.log('📊 NHẬN DIỆN 15 LOẠI CẦU:');
-    console.log('  1. Cầu bệt');
-    console.log('  2. Cầu đảo');
-    console.log('  3. Cầu nhịp (2-2-2, 3-3-2, 2-3-2, 3-2-3)');
-    console.log('  4. Cầu 1-1-2-2');
-    console.log('  5. Cầu 2-2-1-1');
-    console.log('  6. Cầu 3-3');
-    console.log('  7. Cầu 2-3-2');
-    console.log('  8. Cầu 3-2-3');
-    console.log('  9. Cầu xen kẽ chéo');
-    console.log('  10. Cầu 1-2-1-2');
-    console.log('  11. Cầu 2-1-2-1');
-    console.log('  12. Cầu 1-1-1-2');
-    console.log('  13. Cầu 2-1-1-1');
-    console.log('  14. Cầu cực dài (8+ ván)');
-    console.log('  15. Cầu hỗn hợp');
-    console.log('========================================');
-    console.log('🎯 KHÔNG RANDOM - KHÔNG CỨNG NHẮC');
-    console.log('📈 CHỈ TĂNG PHIÊN KHI CÓ CẦU MỚI');
+    console.log('📊 LẤY DỮ LIỆU TRỰC TIẾP TỪ API');
+    console.log('🎯 PHÂN TÍCH 15 LOẠI CẦU');
     console.log('🔄 F5 KHÔNG TĂNG PHIÊN');
-    console.log('📊 TỈ LỆ DỰ ĐOÁN: 55-80%');
+    console.log('📈 TĂNG PHIÊN KHI CÓ KẾT QUẢ MỚI');
     console.log('========================================');
 });
